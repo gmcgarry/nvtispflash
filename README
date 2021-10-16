@@ -1,3 +1,7 @@
+
+[This fork includes support for .ihex files.]
+
+
 A basic serial mode ISP programmer for Nuvoton N76E003, under Linux
 
 This program is released under the GPL v2 or later license. See

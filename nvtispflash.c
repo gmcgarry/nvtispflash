@@ -47,6 +47,50 @@ static const struct {
 	{ 3, 15 }, { 2, 16 }, { 1, 17 }, { 0, 18 }
 };
 
+int 
+parse_hex(int sf, uint8_t *mem)
+{
+	char line[512];
+	size_t len = 0;
+	int i, temp;
+	int line_len, line_type, line_address;
+	int total_length = 0;
+
+#define MAXI(x,y)	((x) > (y) ? (x) : (y))
+
+	while (1) {
+		for (len = 0; len < sizeof(line)-1;  len++) {
+			int rc = read(sf, &line[len], 1);
+			if (rc < 0)
+				return -1;
+			if (rc == 0 || line[len] == '\n')
+				break;
+		}
+		if (len == 0)
+			break;
+		line[len] = '\0';
+		if (line[0] != ':')
+			return -1;
+		sscanf(line+1,"%2X",&line_len);
+		sscanf(line+3,"%4X",&line_address);
+		sscanf(line+7,"%2X",&line_type);
+		printf("Line len %d, type %d, address 0x%4.4x\n", line_len, line_type, line_address);
+		if (line_type == 0) {
+			for (i = 0; i < line_len; i++) {
+				sscanf(line + 9 + i * 2, "%2X", &temp);
+				mem[line_address+i] = temp;
+				printf(" %02x", temp);
+			}
+			printf("\n");
+			total_length = MAXI(total_length, line_address + line_len);
+		}
+	}
+
+#undef MAXI
+
+	return total_length;
+}
+
 /* Compute the sum of all bytes of a command. The response checksum
  * must match it. */
 static uint32_t calc_checksum(const struct pkt_cmd *cmd)
@@ -68,7 +112,15 @@ static int send_cmd(struct dev *dev, struct pkt_cmd *cmd)
 	cmd->pkt_num = dev->pkt_num;
 	dev->checksum = calc_checksum(cmd);
 
-	rc = sp_blocking_write(dev->sp, cmd, sizeof(*cmd), 5000);
+#ifdef DEBUG
+	printf("send_cmd: ");
+	unsigned char *ch = (void *)cmd;
+	for (int i = 0; i < sizeof(*cmd); i++)
+		printf("%02x ", *ch++);
+	printf("\n");
+#endif
+
+	rc = sp_blocking_write(dev->sp, cmd, sizeof(*cmd), SERIAL_TIMEOUT);
 	if (rc != sizeof(*cmd))
 		return -ETIMEDOUT;
 
@@ -85,18 +137,29 @@ static int read_response(struct dev *dev, int timeout_ms)
 	void *p = &dev->ack;
 	int len = sizeof(dev->ack);
 
-	if (timeout_ms)
+	if (timeout_ms) {
+#ifdef DEBUG
+		unsigned char *ch = p;
+
+		rc = 0;
+		for (int i = 0; i < len; i++) {
+			rc += sp_blocking_read(dev->sp, ch, 1, timeout_ms / len);
+			printf("%02x ", *ch++);
+		}
+#else
 		rc = sp_blocking_read(dev->sp, p, len, timeout_ms);
-	else
+#endif
+	} else {
 		rc = sp_nonblocking_read(dev->sp, p, len);
+	}
 	if (rc == len) {
 		if (dev->ack.pkt_num != dev->pkt_num) {
-			printf("bad reply pkt_num: %u vs. %u\n", dev->ack.pkt_num, dev->pkt_num);
+			printf("bad reply pkt_num: %u (0x%04x) vs. %u (0x%04x) \n", dev->ack.pkt_num, dev->ack.pkt_num, dev->pkt_num, dev->pkt_num);
 			return -EIO;
 		}
 
 		if (dev->ack.checksum != dev->checksum) {
-			printf("bad checksum %x vs %x\n", dev->ack.checksum, dev->checksum);
+			printf("bad checksum 0x%04x vs 0x%04x\n", dev->ack.checksum, dev->checksum);
 			return -EIO;
 		}
 
@@ -265,7 +328,7 @@ static int dev_update_aprom(struct dev *dev)
 {
 	int fd;
 	struct stat statbuf;
-	char buf[18 * 1024];
+	uint8_t buf[18 * 1024];
 	bool first = true;
 	int total_length;
 	int to_copy;
@@ -276,23 +339,37 @@ static int dev_update_aprom(struct dev *dev)
 	if (fd == -1)
 		return -errno;
 
-	rc = fstat(fd, &statbuf);
+	rc = read(fd, &buf[0], 1);
 	if (rc == -1)
 		return -errno;
 
-	if (statbuf.st_size == 0)
-		return -EBADF;
+	lseek(fd, 0, SEEK_SET);
 
-	if (statbuf.st_size > dev->aprom_size)
-		return -E2BIG;
+	if (buf[0] == ':') {
+		memset(buf, 0xff, sizeof(buf));
+		rc = parse_hex(fd, buf);
+		if (rc < 0)
+			return rc;
+		total_length = rc;
+	} else {
+		rc = fstat(fd, &statbuf);
+		if (rc == -1)
+			return -errno;
 
-	/* TODO: loop until all read, or use mmap instead. */
-	rc = read(fd, buf, statbuf.st_size);
-	if (rc != statbuf.st_size)
-		return -EIO;
+		if (statbuf.st_size == 0)
+			return -EBADF;
+
+		if (statbuf.st_size > dev->aprom_size)
+			return -E2BIG;
+
+		/* TODO: loop until all read, or use mmap instead. */
+		rc = read(fd, buf, statbuf.st_size);
+		if (rc != statbuf.st_size)
+			return -EIO;
+		total_length = statbuf.st_size;
+	}
 
 	p = buf;
-	total_length = statbuf.st_size;
 
 	while (total_length) {
 		struct pkt_cmd cmd = {};
@@ -508,6 +585,8 @@ int main(int argc, char *argv[])
 	rc = dev_sync_packno(&dev);
 	if (rc)
 		errx(EXIT_FAILURE, "Can't sync packet numbers");
+
+	printf("Synchronised packet number\n");
 
 	rc = generic_command(&dev, CMD_GET_FWVER);
 	if (rc)
