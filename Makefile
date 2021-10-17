@@ -1,4 +1,4 @@
-CFLAGS = -O2 -Wall -I. -L.
+CFLAGS = -O2 -Wall -I. -L. -framework CoreFoundation -framework IOKit
 LDLIBS = -lserialport
 
 all: nvtispflash
